@@ -1,4 +1,4 @@
 # SR
 Spatial Regression
 
-Link: lblenn.github.io/SR
+Link: (link)[https://lblenn.github.io/SR]
