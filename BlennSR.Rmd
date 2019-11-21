@@ -1,0 +1,395 @@
+---
+title: "Lauren's Spatial Regression"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r Setup, message=FALSE, warning=FALSE}
+packages<-c("cowplot", "dplyr", "geosphere", "ggplot2", "ggExtra", "maps", "maptools", "readxl", "rgdal", "rgeos", "sf", "sp", "spatialreg", "spdep", "tidyr", "viridis", "mapproj", "maps", "maptools", "spatialreg")
+sapply(packages, require, character.only=T)
+```
+
+```{r Import Data, message=FALSE, warning=FALSE}
+data <- read.csv('./Data/childpov18_southfull.csv', 
+                   colClasses = c("character", "character", "character", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric"))
+```
+
+```{r Rename Column, message=FALSE, warning=FALSE}
+names(data)[names(data)=="X2016.child.poverty"] <- "child.pov.2016"
+```
+
+
+# Analysis   
+```{r Get Subset of Idaho Data}
+tn_pov <- data %>% subset(State == "TN")
+
+summary(tn_pov)
+```
+
+```{r Define Equation, message=FALSE, warning=FALSE}
+equation <- child.pov.2016 ~ rural + urban + lnmanufacturing + lnag + 
+            lnretail + lnhealthss + lnconstruction + lnlesshs + 
+            lnunemployment + lnsinglemom + lnblack + lnhispanic + 
+            lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+
+# limit units
+options(scipen = 5)
+```
+
+```{r Trying OLS}
+ols <- lm(equation, data=tn_pov)
+summary(ols)
+```
+P-values indicate that less than high school education, unemployment, and one race variable are significant.
+
+
+# Contiguity Neighbors
+```{r Contiguity Neighbors, message=FALSE, warning=FALSE}
+#Obtain FIPS Codes by county 
+fips <- county.fips
+
+#Create county polygons
+tnmap <- map(database = "county", regions = "tennessee", fill=T, plot=F)
+IDs <- sub("^tnmap,","",tnmap$names)
+
+#Add FIPS codes to the county polygons
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+tn_fips <- subset(fips.codes, state=="tennessee", select=fips)
+names <- fips.codes$county
+tn_IDs <- unique(tn_fips$fips)
+
+#Create spatial polygons
+tn_sp = map2SpatialPolygons(tnmap,tn_fips$fips,CRS("+proj=longlat"))
+names(tn_sp@polygons) <- tn_IDs
+
+#Create neighbor weights using the queens case
+neighb.data <- poly2nb(tn_sp, queen=T)
+names(neighb.data) <- names(tn_sp@polygons)
+
+#Create list of neighbors
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+```
+
+
+
+# Moran’s Correlation and LaGrange Multiplier Tests
+```{r Morans Test}
+lm.morantest(ols, cont.neighb)
+```
+P-value is insignificant, therefore we fail to reject H0. (Right?)
+
+```{r LaGrange Multiplier Tests}
+lm.LMtests(ols, cont.neighb, test="all")
+```
+Results:
+LMerr: 0.7995
+LMlag: 0.9903
+RLMerr: 0.6769
+RLMlag: 0.7409
+SARMA: 0.9168
+
+These results indicate that a spatial lag model would fit the data best.
+
+
+
+# Spatial Lag Models
+```{r SLX Model}
+SLX.model <- lmSLX(equation, data=tn_pov, cont.neighb)
+summary(SLX.model)
+```
+Lagged variables were not significant. Maybe an error model would be better? Let's get a closer look:
+```{r SLX Model Summary Matrix}
+summary(impacts(SLX.model, cont.neighb), zstats = TRUE)[["pzmat"]]
+```
+
+```{r Spatial Lag Model}
+sp.lag.model <- spatialreg::lagsarlm(equation, data=tn_pov, cont.neighb)
+summary(sp.lag.model, Nagelkerke = TRUE)
+```
+P-value = 0.98967 
+Not significant. Let's move on to an error model.
+
+
+# Spatial Error Models
+```{r Spatial Error Models}
+sp.err.model <- spatialreg::errorsarlm(equation, data=tn_pov, cont.neighb)
+summary(sp.err.model, Nagelkerke = TRUE)
+```
+Significant variables: Less than high school education, unemployment, and percent of the population that is hispanic.
+
+
+# Comparing Models  
+SLX	Model  
+  Adj-R2: 0.5701  
+  p-value: 0.00000004515  
+        
+Lag Model    
+  R2: 0.6105   
+  p-value: 0.98967  
+         
+Err Model    
+  R2: 0.61093    
+  p-value: 0.74655    
+
+This indicates that our spatial error model most likely fits best. Let's test it.  
+
+```{r Hausman Test}
+spatialreg::Hausman.test(sp.err.model)
+```
+Based on the p-value of 0.732 we would not reject the HO that the estimation method should yield coefficients appropriate for a spatial error model. 
+
+```{r Spatial Durbin Model}
+sd.err <- spatialreg::errorsarlm(equation, tn_pov, cont.neighb, etype = "emixed")
+sdm <- spatialreg::lagsarlm(equation, tn_pov, cont.neighb, type = "mixed")
+
+summary(sd.err, Nagelkerke = TRUE)
+```
+P-value: 0.020913
+Not significant. This may not be the best model fit. 
+
+```{r Impacts Matrix}
+summary(spatialreg::impacts(sd.err, listw = cont.neighb, R = 100), zstats = TRUE)[["pzmat"]]
+```
+Based on the impacts analysis, we can see not many of the impacts are significant, so we might consider limiting the model to either the spatial error, SLX, or OLS models. 
+
+
+# Comparing Spatial-Durbin to the other models
+```{r Spatial-Durbin vs. Spatial Error}
+spatialreg::LR.sarlm(sd.err,sp.err.model)
+```
+
+```{r SD vs. SLX}
+spatialreg::LR.sarlm(sd.err,SLX.model)
+```
+
+```{r SD vs. OLS}
+spatialreg::LR.sarlm(sd.err,ols)
+```
+These results indicate that this model would be best restricted to an SLX model. 
+
+
+# K-Neighbors (AKA OK BOOMER)
+```{r County Polygon Centroids, message=FALSE, warning=FALSE}
+all.xy <- centroid(tn_sp)
+#tx_IDs <- unique(tx_fips$fips) this value was created in the contiguity section but would be needed here if only using distance functions. See "creating list of contiguity neighbors" for details.
+rownames(all.xy) <- tn_IDs
+colnames(all.xy) <- cbind("x","y")
+```
+
+```{r Creating Neighbors, message=FALSE, warning=FALSE}
+#Create neighbors
+all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+#Determine max k distance value to neighbor
+all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+#Calculate neighbors based on distance
+all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+#Create neighbor list
+all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+```
+
+
+# Distance Lag Model
+```{r Distance Lag Model, message=FALSE, warning=FALSE}
+all.dist.lag.k1 <- lagsarlm(equation, data = tn_pov, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- lagsarlm(equation, data = tn_pov, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- lagsarlm(equation, data = tn_pov, listw = all.dist.neighb.k5)
+```
+
+```{r Only K1}
+summary(all.dist.lag.k1, Nagelkerke = TRUE)
+```
+
+# Distance Error Model
+```{r Distance Error Model, message=FALSE, warning=FALSE}
+all.dist.err.k1 <- errorsarlm(equation, data = tn_pov, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- errorsarlm(equation, data = tn_pov, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- errorsarlm(equation, data = tn_pov, listw = all.dist.neighb.k5)
+```
+
+```{r Only K1 again}
+summary(all.dist.err.k1, Nagelkerke = TRUE)
+```
+Comparing the two:
+Dis. Lag:
+  R2: 0.61083
+  P-value: 0.77695
+  AIC: 581.02
+Dis. Error:
+  R2: 0.61222
+  P-value: 0.51714
+  AIC: 580.68
+While the two models are relatively comparable, we can see that again the error model is generally a better fit for the dataset.  
+
+
+# Mapping the Models
+```{r Combining Poverty and Error Model, message=FALSE, warning=FALSE}
+dist.err.data <- summary(all.dist.err.k1, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(tn_pov$FIPS,
+                               dist.err.data$fitted.values, 
+                               dist.err.data$residual, 
+                               tn_pov$child.pov.2016, 
+                               tn_pov$lnsinglemom, 
+                               tn_pov$lnuninsured, 
+                               tn_pov$lnlesshs, 
+                               tn_pov$lnincome_ratio,
+                               stringsAsFactors = FALSE)
+
+#Renaming columns
+colnames(dist.err.output) <- c("fips","fitted","resid","childpov",
+                               "single_mom","uninsured","less_hs","income_ratio")
+```
+
+```{r Split Data, message=FALSE, warning=FALSE}
+#Create quantiles
+quantiles_sm <- dist.err.output %>%
+  pull(single_mom) %>%
+  quantile(probs = seq(0, 1, length.out = 4), na.rm = TRUE)
+
+quantiles_pov <- dist.err.output %>%
+  pull(childpov) %>%
+  quantile(probs = seq(0, 1, length.out = 4), na.rm = TRUE)
+
+#Create ranks
+sm_rank <- cut(dist.err.output$single_mom, 
+               breaks= quantiles_sm, 
+               labels=c("1", "2", "3"), 
+               na.rm = TRUE, 
+               include.lowest = TRUE)
+
+pov_rank <- cut(dist.err.output$childpov, 
+                breaks= quantiles_pov, 
+                labels=c("1", "2", "3"), 
+                na.rm = TRUE,
+                include.lowest = TRUE)
+
+#Join ranks and combined column to dataset
+dist.err.output$mom_score <- as.numeric(sm_rank)
+dist.err.output$pov_score <- as.numeric(pov_rank)
+dist.err.output$mom_pov <- paste(as.numeric(dist.err.output$pov_score), 
+                         "-", 
+                         as.numeric(dist.err.output$mom_score))
+```
+
+```{r Legend, message=FALSE, warning=FALSE}
+legend_colors <- tibble(
+  x = c(3,2,1,3,2,1,3,2,1),
+  y = c(3,3,3,2,2,2,1,1,1),
+  z = c("#574249", "#627f8c", "#64acbe", "#985356", "#ad9ea5", "#b0d5df", "#c85a5a", "#e4acac", "#e8e8e8"))
+
+xlabel <- "Poverty,Low \u2192 High"
+xlabel <- gsub(",", "\n", xlabel)
+ylabel <- "Single Mother Household,Low \u2192 High"
+ylabel <- gsub(",", "\n", ylabel)
+
+legend <- ggplot(legend_colors, aes(x,y)) + 
+  geom_tile(aes(fill=z)) + 
+  theme_minimal() + theme(legend.position = "none") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  labs(x = xlabel, y = ylabel) + 
+  scale_fill_identity() +
+  ggtitle("Legend") +
+  theme(axis.title.y = element_text(face = "italic", hjust = 0.5, size = 8)) +
+  theme(axis.title.x = element_text(face = "italic", hjust = 0.5, size = 8)) +
+  theme(plot.title = element_text(face="bold", hjust = 0.5, size = 10))
+```
+
+```{r Making the Map, message=FALSE, warning=FALSE}
+world <- map_data("world")
+states <- map_data("state")
+counties <- map_data("county")
+
+counties$polyname <- paste(counties$region, counties$subregion, sep = ",")
+counties <- counties %>% left_join(fips, by = c("polyname" = "polyname"))
+counties$fips <- as.character(counties$fips)
+counties <- counties %>% left_join(tn_pov, by = c("fips" = "FIPS"))
+
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+
+southern_counties <- subset(counties, region %in% 
+                              c("texas", "arkansas", "louisiana", "mississippi", 
+                                "alabama", "georgia", "florida", "north carolina",
+                                "south carolina", "tennessee", "oklahoma", 
+                                "kentucky", "west virginia", "virginia", 
+                                "maryland", "delaware", "district of columbia"))
+
+tenn_counties <- subset(southern_counties, region == "tennessee")
+```
+
+```{r Attach Polygons, message=FALSE, warning=FALSE}
+#Attach the data via the FIPS column and fortify the polygon
+tn_poly <- tenn_counties %>% 
+  left_join(dist.err.output, by = c("fips" = "fips")) %>%
+  fortify
+
+#Add custom color scheme based on ranks
+bivariate_color_scale <- tibble(
+  "3 - 3" = "#574249", 
+  "2 - 3" = "#627f8c",
+  "1 - 3" = "#64acbe",
+  "3 - 2" = "#985356",
+  "2 - 2" = "#ad9ea5",
+  "1 - 2" = "#b0d5df",
+  "3 - 1" = "#c85a5a",
+  "2 - 1" = "#e4acac",
+  "1 - 1" = "#e8e8e8") %>%
+  gather("group", "fill")
+
+tn_poly <- tn_poly %>% 
+  left_join(bivariate_color_scale, by = c("mom_pov" = "group"))
+```
+
+```{r Bivariate Map, message=FALSE, warning=FALSE}
+mom_pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "gray", color = "white") +
+  geom_polygon(data = tn_poly, aes(x=long, y=lat, group=group, fill = fill)) + 
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, color = "white") +
+  geom_polygon(data = tenn_counties, aes(x=long,y=lat, group=group), fill = NA, color = "black", size = 0.05) +
+  coord_map("conic", lat0 = 35, xlim=c(-93,-80), ylim=c(30,40)) +
+  scale_fill_identity() +
+  theme_grey() + theme(legend.position="bottom") + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'deepskyblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Bivariate Map of Child Poverty and Single Mother Households") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+#mom_pov_map use to preview the map
+```
+
+```{r Final Map}
+final_map <- ggdraw() +
+  draw_plot(mom_pov_map, x = 0, y = 0, width = 1, height = 1) +
+  draw_plot(legend, x = 0.67, y = 0.10, width = 0.2, height = 0.35) 
+
+final_map
+```
